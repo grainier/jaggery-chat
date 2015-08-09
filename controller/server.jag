@@ -1,0 +1,228 @@
+<%
+var md5 = require("../libs/md5.js").md5;
+var log = new Log();
+var server = server || {};
+
+
+server.sockets = application.get('sockets') || {};     // sockets = {client_sock1 : sockObj, ... }
+server.chats = application.get('chats') || {};         // chats = { chat_id : [client_sock1, client_sock2], ...}
+server.users = application.get('users') || {};         // users = { chat_id : [user name, user name], ...}
+server.socketConnection = null;
+server.chatID = null;
+server.userID = null;
+server.actions = {
+    "INITIATE_CHAT": "initiate_chat",
+    "DISCONNECT_CHAT": "disconnect_chat",
+    "START_CHAT": "start_chat",
+    "UPDATE_USERS": "update_users",
+    "APPEND_MESSAGE": "append_message",
+    "NEW_MESSAGE": "new_message",
+    "REMOVE_USER": "remove_user"
+};
+
+
+server.invoke = function (socket, action, data) {
+    switch (action) {
+        case server.actions.INITIATE_CHAT:
+            server.initiate(socket, data);
+            break;
+        case server.actions.NEW_MESSAGE:
+            delete data["action"];
+            server.broadcast(server.actions.APPEND_MESSAGE, data);
+            break;
+        case server.actions.REMOVE_USER:
+            server.disconnect(data);
+            break;
+        default:
+            break;
+    }
+};
+
+
+server.initiate = function (socket, data) {
+    server.userID = data.from;
+    server.chatID = data.chat;
+    var socketKey = server.getSocketKey(server.userID, server.chatID);
+    server.addSocket(socketKey, socket);
+    server.addSocketKeyToChat(server.chatID, socketKey);
+    server.addUserToChat(server.chatID, server.userID);
+    server.send({
+        "action": server.actions.START_CHAT,
+        "data": data,
+        "status": "success"
+    });
+};
+
+
+server.disconnect = function (data) {
+    var user = data.user;
+    var socketKey = server.getSocketKey(user, server.chatID);
+    var dcSocket = server.getSocket(socketKey);
+    dcSocket.send(stringify({
+        "action": server.actions.DISCONNECT_CHAT,
+        "data": {
+            "from": server.userID
+        },
+        "status": "success"
+    }));
+    server.removeUserFromChat(server.chatID, user);
+    server.removeSocket(socketKey);
+    server.removeSocketKeyFromChat(server.chatID, socketKey);
+};
+
+
+server.addSocketKeyToChat = function (chat, socketKey) {
+    server.chats = application.get('chats') || {};
+    if (chat in server.chats) {
+        server.chats[chat].push(socketKey);
+    } else {
+        server.chats[chat] = [socketKey];
+    }
+    application.put('chats', server.chats);
+    log.info("addSocketKeyToChat | chats : " + stringify(server.chats));
+};
+
+
+server.addUserToChat = function (chat, user) {
+    server.users = application.get('users') || {};
+    if (chat in server.users) {
+        server.users[chat].push(user);
+    } else {
+        server.users[chat] = [user];
+    }
+    application.put('users', server.users);
+
+    // notify other users about the new user
+    server.broadcast(server.actions.UPDATE_USERS, {
+        "users": server.users[chat]
+    });
+
+    log.info("addUserToChat | users : " + stringify(server.users));
+};
+
+
+server.removeUserFromChat = function (chat, user) {
+    server.users = application.get('users') || {};
+    if (chat in server.users) {
+        var usrs = server.users[chat];
+        var index = usrs.indexOf(user);
+        if (index > -1) {
+            usrs.splice(index, 1);
+        }
+
+        if (usrs.length > 0) {
+            server.users[chat] = usrs;
+            // notify others about removed user
+            server.broadcast(server.actions.UPDATE_USERS, {
+                "users": server.users[chat]
+            });
+        } else {
+            delete server.users[chat];
+        }
+        application.put('users', server.users);
+        log.info("removeUserFromChat | users : " + stringify(server.users));
+    }
+};
+
+
+server.removeSocketKeyFromChat = function (chat, socketKey) {
+    server.chats = application.get('chats') || {};
+    if (chat in server.chats) {
+        var socks = server.chats[chat];
+        var index = socks.indexOf(socketKey);
+        if (index > -1) {
+            socks.splice(index, 1);
+        }
+        if (socks.length > 0) {
+            server.chats[chat] = socks;
+        } else {
+            delete server.chats[chat];
+        }
+        application.put('chats', server.chats);
+        log.info("removeSocketKeyFromChat | chats : " + stringify(server.chats));
+    }
+};
+
+
+server.getSocketKey = function (user, chat) {
+    return md5(user + "::" + chat)
+};
+
+
+server.addSocket = function (key, socket) {
+    server.sockets = application.get('sockets') || {};
+    server.sockets[key] = socket;
+    application.put('sockets', server.sockets);
+    log.info("addSocket | sockets : " + stringify(server.sockets));
+};
+
+
+server.removeSocket = function (key) {
+    server.sockets = application.get('sockets') || {};
+    if (key in server.sockets) {
+        delete server.sockets[key];
+        application.put('sockets', server.sockets);
+    }
+    log.info("addSocket | sockets : " + stringify(server.sockets));
+};
+
+
+server.getSocket = function (key) {
+    server.sockets = application.get('sockets') || {};
+    if (key in server.sockets) {
+        return server.sockets[key];
+    } else {
+        return null;
+    }
+};
+
+
+server.send = function (data) {
+    if (typeof server.socketConnection !== "undefined" && server.socketConnection !== null) {
+        server.socketConnection.send(stringify(data));
+    }
+    else {
+        log.error("socket connection not initialised yet.");
+    }
+};
+
+
+server.broadcast = function (action, data) {
+    server.chats = application.get('chats') || {};
+    server.sockets = application.get('sockets') || {};
+    log.info(stringify(server.chats));
+
+    var clients = server.chats[server.chatID];
+    for (var i = 0; i < clients.length; i++) {
+        var s = server.sockets[clients[i]];
+        s.send(stringify({
+            "action": action,
+            "data": data,
+            "status": "success"
+        }));
+    }
+};
+
+
+(function () {
+    if (typeof webSocket !== "undefined") {
+
+        webSocket.ontext = function (data) {
+            server.socketConnection = this;
+            var json = parse(data);
+            server.invoke(server.socketConnection, json.action, json.data);
+        };
+
+        webSocket.onbinary = function (stream) {
+            log.info('Client Streamed : ' + stream.toString());
+        };
+
+        webSocket.onclose = function () {
+            server.disconnect(server.userID);
+        };
+    }
+    else {
+        log.warn("send a web socket request (ie: ws://example.com/server.jag)");
+    }
+})();
+%>
